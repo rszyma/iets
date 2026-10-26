@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use super::event::{BuildEvent, Kind, fmt_duration};
 
-use crate::log::{interactive, json, note_mismatch, strip_ansi};
+use crate::log::{MISMATCH, interactive, json, note_mismatch, strip_ansi};
 use crate::store::path::find_store_prefix;
 use crate::sys::tty;
 
@@ -180,6 +180,9 @@ pub struct Renderer {
     /// a failed dependency only afterwards, so a verdict waits here until the
     /// op is over or the daemon contradicts it.
     held: HashMap<String, Build>,
+    /// A hash mismatch explains the whole failure: quiet mode then shows
+    /// only the mismatch, not a verdict per failed build.
+    failures_muted: bool,
 }
 
 impl Renderer {
@@ -198,7 +201,19 @@ impl Renderer {
             verdicted: HashSet::new(),
             owned: HashSet::new(),
             held: HashMap::new(),
+            failures_muted: false,
         }
+    }
+
+    /// Quiet mode shows no build output; a hash mismatch still shows.
+    pub fn quiet(&self) -> bool {
+        self.style.quiet
+    }
+
+    /// A hash mismatch explains the whole failure: show only the mismatch,
+    /// not a verdict per failed build.
+    pub fn mute_failures(&mut self) {
+        self.failures_muted = true;
     }
 
     /// Draws the running builds through `live`.
@@ -317,6 +332,7 @@ impl Renderer {
             let why = (!ok).then_some("the daemon named it only after the build ended");
             self.verdict_block(&b, ok, why);
         }
+        self.failures_muted = false;
         self.redraw(false);
     }
 
@@ -426,14 +442,19 @@ impl Renderer {
         if e.drv.is_empty() {
             note_mismatch(&text);
         }
+        // Quiet mode drops the build logs but still shows the hash mismatch
+        // itself: `nix build` without `-L` names the expected and actual
+        // hashes, and nothing else. The daemon's other error lines only
+        // repeat the cascade the mismatch already explains.
+        let is_mismatch = strip_ansi(&text).contains(MISMATCH);
         // A line the daemon did not attribute belongs to the running build
         // when there is exactly one: that is what a remote builder's own
         // stderr looks like coming back through the daemon.
-        let daemon = e.drv.is_empty() && !self.style.quiet;
+        let daemon = e.drv.is_empty() && (!self.style.quiet || is_mismatch);
         let key = match self.running.contains_key(&e.drv) {
             true => e.drv.clone(),
             false if self.running.len() == 1 => {
-                if daemon && json() {
+                if daemon && (json() || (self.style.quiet && is_mismatch)) {
                     self.note(&text);
                 }
                 self.running.keys().next().expect("one running").clone()
@@ -447,6 +468,12 @@ impl Renderer {
                 return;
             }
         };
+        // An attributed mismatch line goes out on its own too: without
+        // `-L` the block it sits in never prints. Unattributed mismatch
+        // lines already went out through `daemon` above.
+        if self.style.quiet && is_mismatch && !e.drv.is_empty() {
+            self.note(&text);
+        }
         let Some(b) = self.running.get_mut(&key) else {
             return;
         };
@@ -565,9 +592,15 @@ impl Renderer {
             }
             None if !ok => {
                 self.tally(false);
-                let l =
-                    self.failed_line(&short_label(&e.attr), e.pos.as_deref(), e.elapsed, reason);
-                self.line(l);
+                if !self.failures_muted {
+                    let l = self.failed_line(
+                        &short_label(&e.attr),
+                        e.pos.as_deref(),
+                        e.elapsed,
+                        reason,
+                    );
+                    self.line(l);
+                }
             }
             None => {}
         }
@@ -589,17 +622,22 @@ impl Renderer {
             if !self.failed.contains(&e.drv) {
                 self.succeeded = self.succeeded.saturating_sub(1);
                 self.tally(false);
-                let l = self.failed_line(
-                    &short_label(&e.attr),
-                    e.pos.as_deref(),
-                    e.elapsed,
-                    Some(reason),
-                );
-                self.line(l);
+                if !self.failures_muted {
+                    let l = self.failed_line(
+                        &short_label(&e.attr),
+                        e.pos.as_deref(),
+                        e.elapsed,
+                        Some(reason),
+                    );
+                    self.line(l);
+                }
             }
             return;
         }
         self.tally(false);
+        if self.failures_muted {
+            return;
+        }
         let head = self.failed_line(
             &short_label(&e.attr),
             e.pos.as_deref(),
@@ -634,6 +672,9 @@ impl Renderer {
 
     fn verdict_block(&mut self, b: &Build, ok: bool, reason: Option<&str>) {
         self.tally(ok);
+        if !ok && self.failures_muted {
+            return;
+        }
         let verdict = if ok {
             format!(
                 "{}  {} {}",
@@ -1294,5 +1335,100 @@ pub(super) mod tests {
             log_tail: vec![],
         }));
         assert!(text(&s).contains("checks.x.a> error: the cause"));
+    }
+
+    fn quiet_ci() -> (Renderer, Sink) {
+        let s = Sink::default();
+        let style = Style {
+            mode: Mode::Ci,
+            color: false,
+            fold: false,
+            quiet: true,
+        };
+        (Renderer::new(style, Box::new(s.clone())), s)
+    }
+
+    /// `nix build` without `-L` drops the log lines and shows only the hash
+    /// mismatch: the `Cannot build ... dependency failed` lines only repeat
+    /// the cascade the mismatch already explains.
+    #[test]
+    fn quiet_shows_only_mismatches() {
+        use crate::log::MISMATCH;
+
+        let (mut r, s) = quiet_ci();
+        r.event(&ev(Kind::Started));
+        // no start line when quiet
+        assert!(!text(&s).contains("building"), "{}", text(&s));
+        // regular output stays hidden: one running build buffers it
+        r.event(&BuildEvent::new(
+            "checks.x.a",
+            "/nix/store/a.drv",
+            Kind::Log(b"downloading".to_vec()),
+            Duration::ZERO,
+        ));
+        assert!(!text(&s).contains("downloading"), "{}", text(&s));
+        // a generic daemon error stays hidden too
+        r.event(&BuildEvent::new(
+            "",
+            "",
+            Kind::Log(b"error: build of '/nix/store/a.drv' failed".to_vec()),
+            Duration::ZERO,
+        ));
+        assert!(!text(&s).contains("build of"), "{}", text(&s));
+        // the mismatch goes out on its own, unattributed or attributed
+        let mismatch = format!(
+            "error: {} '/nix/store/a.drv':\n  specified: sha256-A=\n     got:    sha256-B=",
+            MISMATCH
+        );
+        r.event(&BuildEvent::new(
+            "",
+            "",
+            Kind::Log(mismatch.clone().into_bytes()),
+            Duration::ZERO,
+        ));
+        assert!(text(&s).contains("specified: sha256-A="), "{}", text(&s));
+        r.event(&BuildEvent::new(
+            "checks.x.a",
+            "/nix/store/a.drv",
+            Kind::Log(mismatch.into_bytes()),
+            Duration::ZERO,
+        ));
+        assert!(!text(&s).contains("downloading"), "{}", text(&s));
+    }
+
+    /// When a mismatch explains the failure, quiet mode shows only the
+    /// mismatch: the root's own verdict stays silent too.
+    #[test]
+    fn muted_failures_print_nothing() {
+        let (mut r, s) = quiet_ci();
+        r.mute_failures();
+        r.event(&ev(Kind::Started));
+        r.event(&BuildEvent::new(
+            "",
+            "",
+            Kind::Log(b"error: build of '/nix/store/a.drv' failed".to_vec()),
+            Duration::ZERO,
+        ));
+        r.stopped("/nix/store/a.drv", false);
+        r.release();
+        assert!(text(&s).is_empty(), "{}", text(&s));
+    }
+
+    /// Same for a held verdict the daemon names only after the build ended.
+    #[test]
+    fn muted_held_verdicts_print_nothing() {
+        let (mut r, s) = quiet_ci();
+        r.mute_failures();
+        r.event(&ev(Kind::Started));
+        r.stopped("/nix/store/a.drv", false);
+        assert!(text(&s).is_empty(), "{}", text(&s));
+        r.event(&BuildEvent::new(
+            "",
+            "",
+            Kind::Log(b"error: build of '/nix/store/a.drv' failed".to_vec()),
+            Duration::ZERO,
+        ));
+        r.release();
+        assert!(text(&s).is_empty(), "{}", text(&s));
     }
 }

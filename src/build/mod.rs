@@ -184,6 +184,18 @@ impl Reporter {
         self.render.lock().unwrap().event(e);
     }
 
+    /// A hash mismatch explains the whole failure: quiet mode then shows
+    /// only the mismatch, not a verdict per failed build.
+    fn mute_on_mismatch(&mut self, mismatches: usize) {
+        if mismatches == 0 {
+            return;
+        }
+        let mut render = self.render.lock().unwrap();
+        if render.quiet() {
+            render.mute_failures();
+        }
+    }
+
     fn duration(&self, drv: &str) -> Duration {
         match self.timing.get(drv) {
             Some((_, Some(d))) => *d,
@@ -332,6 +344,23 @@ impl Dispatcher {
             prov: &self.prov,
             by_drv: &by_drv,
         };
+        // A mismatch is a fact about a fixed-output derivation of this batch's
+        // closure, from the daemon; anything else that prints the words is
+        // dropped. Nix's worker sets the hash-mismatch flag for the whole run,
+        // so a root whose dependency mismatched exits 102 as well. This runs
+        // before the verdicts: when a mismatch explains the failure, quiet
+        // mode shows only the mismatch.
+        let planned = OnceCell::new();
+        let closure = &*up;
+        let kept = log::resolve_mismatches(&|specified| {
+            (planned.get_or_init(|| closure.drvs(&roots, true).unwrap_or_default()))
+                .iter()
+                .any(|d| has_output_hash(d, specified))
+        });
+        if kept > 0 {
+            self.exit = log::combine_exit(self.exit, 102);
+            self.reporter.mute_on_mismatch(kept);
+        }
         let earlier_failed = status.values().any(|s| !s.ok);
         let mut out = Vec::with_capacity(batch.len());
         for t in batch {
@@ -423,20 +452,6 @@ impl Dispatcher {
                     });
                 }
             }
-        }
-        // A mismatch is a fact about a fixed-output derivation of this batch's
-        // closure, from the daemon; anything else that prints the words is
-        // dropped. Nix's worker sets the hash-mismatch flag for the whole run,
-        // so a root whose dependency mismatched exits 102 as well.
-        let planned = OnceCell::new();
-        let closure = &*up;
-        let kept = log::resolve_mismatches(&|specified| {
-            (planned.get_or_init(|| closure.drvs(&roots, true).unwrap_or_default()))
-                .iter()
-                .any(|d| has_output_hash(d, specified))
-        });
-        if kept > 0 {
-            self.exit = log::combine_exit(self.exit, 102);
         }
         self.reporter.release();
         Ok(out)
@@ -884,6 +899,179 @@ mod tests {
                 "{n}'s log block is interleaved: {out}"
             );
         }
+    }
+
+    /// A backend that fails every job the way a root fails when its
+    /// dependency failed, after streaming one unattributed daemon line.
+    struct Mismatch {
+        line: Vec<u8>,
+    }
+
+    impl Backend for Mismatch {
+        fn query_valid(
+            &mut self,
+            _paths: &[&StorePath],
+            _on_event: &mut dyn FnMut(Event),
+        ) -> Result<HashSet<String>> {
+            Ok(HashSet::new())
+        }
+
+        fn substitute(
+            &mut self,
+            _paths: &[StorePath],
+            _on_event: &mut dyn FnMut(Event),
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_objects(
+            &mut self,
+            _objects: &[&Object],
+            _on_event: &mut dyn FnMut(Event),
+        ) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn submit(
+            &mut self,
+            batch: &backend::Batch<'_>,
+            on_event: &mut dyn FnMut(Event),
+        ) -> Result<HashMap<String, backend::Status>> {
+            let drv = batch.jobs[0].drv.to_string();
+            on_event(Event::Started(Started { drv_path: drv }));
+            on_event(Event::Log(Log {
+                drv_path: String::new(),
+                line: self.line.clone(),
+            }));
+            Ok((batch.jobs.iter())
+                .map(|j| {
+                    (
+                        j.drv.to_string(),
+                        backend::Status::failed(
+                            format!("status 10: Cannot build '{}'.", j.drv),
+                            100,
+                        ),
+                    )
+                })
+                .collect())
+        }
+
+        fn outputs(
+            &mut self,
+            _drv: &str,
+            _on_event: &mut dyn FnMut(Event),
+        ) -> Result<BTreeMap<String, Option<String>>> {
+            Err(Error::Store("no outputs".into()))
+        }
+
+        fn fetch(&mut self, _store_path: &str, _dir: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_root(&mut self, _store_path: &str, _link: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn out_links(&mut self, _links: &[(String, Option<String>)]) -> Result<()> {
+            Ok(())
+        }
+
+        fn note_connect(&mut self, _d: Duration) {}
+
+        fn note_upload(&mut self, _p: backend::Phase) {}
+
+        fn report(&self, _plan: &Plan, _plan_time: Duration) -> String {
+            String::new()
+        }
+    }
+
+    /// A closure of one fixed-output derivation the evaluation made.
+    struct FixedDrvs(backend::Drv);
+
+    impl Uploader for FixedDrvs {
+        fn upload(
+            &mut self,
+            _b: &mut dyn Backend,
+            _roots: &[StorePath],
+            _on_event: &mut dyn FnMut(Event),
+        ) -> Result<upload::Stats> {
+            Ok(upload::Stats::default())
+        }
+
+        fn drvs(&self, _roots: &[StorePath], _deep: bool) -> Result<Vec<backend::Drv>> {
+            Ok(vec![backend::Drv {
+                path: self.0.path.clone(),
+                aterm: self.0.aterm.clone(),
+            }])
+        }
+
+        fn roots_answered(&mut self, _roots: &[StorePath], _valid: &HashSet<String>) {}
+    }
+
+    /// A transitive mismatch in quiet mode shows only the mismatch: the
+    /// root's verdict stays silent, and the exit is the mismatch's 102.
+    #[test]
+    fn a_transitive_mismatch_shows_only_itself() {
+        use crate::store::hash::HashAlgo;
+        use crate::store::path::IngestionMethod;
+
+        let session = Session::new();
+        let _entered = session.enter();
+
+        let algo = HashAlgo::Sha256;
+        let hash = Hash::from_bytes(algo, &vec![0u8; algo.size()]).unwrap();
+        let fod = Derivation {
+            name: "mismatch".into(),
+            outputs: BTreeMap::from([(
+                "out".to_string(),
+                DerivationOutput::Fixed {
+                    method: IngestionMethod::Flat,
+                    hash: hash.clone(),
+                },
+            )]),
+            platform: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            ..Derivation::default()
+        };
+        let aterm = fod.unparse().unwrap();
+        let path = fod.drv_path_for(&aterm).unwrap();
+        let specified = hash.to_sri();
+        let got = Hash::from_bytes(algo, &vec![1u8; algo.size()])
+            .unwrap()
+            .to_sri();
+        let line = format!(
+            "error: {} '{path}':\n  specified: {specified}\n     got:    {got}",
+            crate::log::MISMATCH
+        );
+
+        let sink = Sink::default();
+        let style = render::Style {
+            mode: render::Mode::Ci,
+            color: false,
+            fold: false,
+            quiet: true,
+        };
+        let mut d = Dispatcher::with_backend(
+            Box::new(Mismatch {
+                line: line.into_bytes(),
+            }),
+            Provenance::off(),
+            Reporter::with_output(style, Box::new(sink.clone())),
+        );
+        let mut up = FixedDrvs(backend::Drv {
+            path: path.clone(),
+            aterm: Arc::new(aterm),
+        });
+        let outcomes = d
+            .submit(&mut up, vec![Target::new("top", path, vec!["out".into()])])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].success);
+        assert_eq!(outcomes[0].exit, 100);
+        assert_eq!(d.exit, 102);
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains(&specified) && out.contains(&got), "{out}");
+        assert!(!out.contains('✘'), "{out}");
     }
 
     /// A target the build op came back without leaves no output path, so the

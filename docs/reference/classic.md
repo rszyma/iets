@@ -541,8 +541,9 @@ these:
   answers from memory and leaves the store as it was. If you relied on that
   side effect (`nix derivation show X`, then `nix-store --realise X`),
   instantiate first, with `nix-instantiate` or `iets build --no-build`.
-- `nix build` prints log lines only with `-L`. The real one shows the last
-  line in the progress bar, and the whole log when a build fails.
+- `nix build` prints log lines only with `-L`, but a hash mismatch (expected
+  vs actual) always prints, and nothing else. The real one also shows the
+  last line in the progress bar, and the whole log when a build fails.
 - Two installables that name the same derivation print one output path
   each. The real `nix build` prints twice as many.
 - An evaluation error inside a value that `nix eval` prints becomes
